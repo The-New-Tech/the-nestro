@@ -1,0 +1,87 @@
+/**
+ * Lớp "API giả" – toàn bộ thao tác dữ liệu đi qua đây.
+ * Khi có backend: thay thân từng hàm bằng fetch('/api/...') giữ nguyên chữ ký, UI không phải sửa.
+ */
+import { db } from '@/store/db'
+import { genCode, todayKey } from '@/lib/utils'
+import { quote } from '@/lib/pricing'
+import { roomState } from '@/lib/availability'
+import { QR_MINUTES, findRoom } from '@/data/catalog'
+import type { Booking, GuestInfo, BookingStatus } from '@/store/types'
+
+const wait = (ms = 450) => new Promise(r => setTimeout(r, ms))
+
+export interface CreateBookingInput {
+  roomNo: string; checkIn: string; checkOut: string; checkInTime: string; checkOutTime: string
+  adults: number; children: number; childAges: number[]
+  guest: GuestInfo; requests: string[]; note: string; addons: string[]
+  promo?: string; method: string; depositOnly: boolean
+}
+
+/** POST /api/payments/qr – server tạo QR động cho riêng đơn (số tiền + nội dung = mã đặt phòng, hạn 10 phút) */
+export async function createPaymentQr(code: string, amount: number, wallet: string) {
+  await wait(250)
+  return {
+    code, amount, wallet,
+    expiresAt: Date.now() + QR_MINUTES * 60_000,
+    // payload minh hoạ – backend trả chuỗi VietQR/MoMo thật
+    payload: `NESTRO|${wallet}|${code}|${amount}|NESTRO ${code.replace('NST-', '')}`
+  }
+}
+
+/** POST /api/bookings – tạo đơn sau khi thanh toán xác nhận (webhook) */
+export async function createBooking(inp: CreateBookingInput): Promise<Booking> {
+  await wait(900)
+  const st = roomState(db.get(), inp.roomNo, inp.checkIn, inp.checkOut)
+  if (st === 'booked' || st === 'locked') throw new Error('Phòng vừa được người khác đặt. Vui lòng chọn phòng khác.')
+  const room = findRoom(inp.roomNo)!
+  const q = quote(db.get(), { ...inp })
+  const paidAmount = inp.depositOnly ? Math.round(q.total * 0.3) : q.total
+  const code = genCode()
+  const now = new Date().toISOString()
+  const b: Booking = {
+    code, createdAt: now, paidAt: now, status: 'ok', pay: inp.depositOnly ? 'part' : 'paid', channel: 'Website', method: inp.method,
+    roomNo: inp.roomNo, roomType: db.get().roomOverrides[inp.roomNo]?.type ?? room.type, floor: room.floor,
+    checkIn: inp.checkIn, checkOut: inp.checkOut, checkInTime: inp.checkInTime, checkOutTime: inp.checkOutTime,
+    adults: inp.adults, children: inp.children, childAges: inp.childAges, guest: inp.guest, requests: inp.requests, note: inp.note,
+    addons: inp.addons, quote: q, paid: paidAmount
+  }
+  db.set(d => {
+    d.bookings.unshift(b)
+    const o = q.promoCode && d.offers.find(x => x.code === q.promoCode)
+    if (o) o.used += 1
+  })
+  return b
+}
+
+/** GET /api/bookings/lookup?code=&contact= */
+export async function lookupBooking(code: string, contact: string): Promise<Booking | null> {
+  await wait(500)
+  const c = code.trim().toUpperCase().replace(/^(?!NST-)/, 'NST-')
+  const k = contact.trim().toLowerCase()
+  const digits = k.replace(/\D/g, '')
+  return db.get().bookings.find(b =>
+    b.code === c && (b.guest.email.toLowerCase() === k || (digits.length >= 9 && b.guest.phone.replace(/\D/g, '').endsWith(digits.slice(-9))))
+  ) ?? null
+}
+export const getBooking = (code: string) => db.get().bookings.find(b => b.code === code)
+
+export async function updateBooking(code: string, fn: (b: Booking) => void) {
+  await wait(300)
+  db.set(d => { const b = d.bookings.find(x => x.code === code); if (b) fn(b) })
+}
+/** Huỷ miễn phí trước 14:00 một ngày trước nhận phòng, sau đó phạt 1 đêm */
+export function cancelDeadline(b: Booking) {
+  const d = new Date(b.checkIn + 'T00:00:00'); d.setDate(d.getDate() - 2); d.setHours(14, 0, 0, 0)
+  return d
+}
+export async function cancelBooking(code: string) {
+  await updateBooking(code, b => {
+    const free = Date.now() < cancelDeadline(b).getTime()
+    const fee = free ? 0 : (b.quote.nights[0]?.price ?? 0)
+    b.status = 'cancel'; b.pay = b.paid > fee ? 'ref' : b.pay
+    b.paid = Math.max(0, b.paid - (b.paid ? Math.max(0, b.paid - fee) : 0))
+  })
+}
+export async function setBookingStatus(code: string, status: BookingStatus) { await updateBooking(code, b => { b.status = status }) }
+export const today = todayKey
